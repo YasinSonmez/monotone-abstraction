@@ -71,4 +71,3 @@ const double H_RES_3D = 0.8, V_RES_3D = 0.4;
 
 - `safe_set.cpp` - Single source file with all functionality
 - `Makefile` - Build system
-- `README.md` - This documentation

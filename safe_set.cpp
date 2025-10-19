@@ -4,12 +4,16 @@
 #include <cmath>
 #include <algorithm>
 #include <chrono>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 /**
- * Unified Safe Set Computation for Vehicle Following
+ * Safe Set Computation for Vehicle Following
+ * Supports both sequential and parallel execution
  * 
- * Usage: ./safe_set [2d|3d]
- * Example: ./safe_set 3d
+ * Usage: ./safe_set [2d|3d] [precomp|noprecomp] [seq|parallel]
+ * Example: ./safe_set 3d precomp parallel
  */
 
 // ============================================================================
@@ -130,9 +134,18 @@ private:
     std::vector<std::vector<int>> safe_set_basis;
     std::unordered_map<int, std::vector<int>> transition_cache;
     bool is_3d;
+    bool use_parallel;
+    mutable std::mutex cache_mutex;
     
 public:
-    MonotoneAbstraction(const MonotoneDynamics& dynamics, bool use_3d) : dyn(dynamics), is_3d(use_3d) {}
+    MonotoneAbstraction(const MonotoneDynamics& dynamics, bool use_3d, bool parallel = false) 
+        : dyn(dynamics), is_3d(use_3d), use_parallel(parallel) {
+        if (use_parallel) {
+            unsigned int num_threads = std::thread::hardware_concurrency();
+            if (num_threads == 0) num_threads = 8; // fallback
+            std::cout << "Parallel computation initialized with " << num_threads << " threads" << std::endl;
+        }
+    }
     
     void setupRanges() {
         if (is_3d) {
@@ -292,8 +305,16 @@ public:
                                        const std::vector<int>& u_idx, 
                                        const std::vector<int>& w_idx) {
         int flat_idx = flattenIndex(x_idx);
-        if (transition_cache.find(flat_idx) != transition_cache.end()) {
-            return transition_cache[flat_idx];
+        
+        if (use_parallel) {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            if (transition_cache.find(flat_idx) != transition_cache.end()) {
+                return transition_cache[flat_idx];
+            }
+        } else {
+            if (transition_cache.find(flat_idx) != transition_cache.end()) {
+                return transition_cache[flat_idx];
+            }
         }
         
         auto x_val = getPriorityStateAtIdx(x_idx);
@@ -303,7 +324,12 @@ public:
         auto x_plus_val = dyn.nextState(x_val, u_val, w_val);
         auto x_plus_idx = getStateIdx(x_plus_val);
         
-        transition_cache[flat_idx] = x_plus_idx;
+        if (use_parallel) {
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            transition_cache[flat_idx] = x_plus_idx;
+        } else {
+            transition_cache[flat_idx] = x_plus_idx;
+        }
         return x_plus_idx;
     }
     
@@ -367,7 +393,7 @@ public:
     }
     
     void computeSafeSet() {
-        std::cout << "Starting invariant set computation..." << std::endl;
+        std::cout << "Starting " << (use_parallel ? "parallel" : "sequential") << " invariant set computation..." << std::endl;
         
         int iter = 0;
         while (true) {
@@ -376,46 +402,133 @@ public:
             
             std::cout << "Iteration: " << iter << std::endl;
             
-            for (size_t i = 0; i < getBasisSize(); ++i) {
-                auto x_idx = getBasisIdx(i);
-                auto x_val = getPriorityStateAtIdx(x_idx);
+            size_t basis_size = getBasisSize();
+            if (basis_size == 0) break;
+            
+            if (use_parallel) {
+                // Parallel processing of basis elements
+                std::vector<bool> unsafe_flags(basis_size, false);
+                std::mutex unsafe_mutex;
                 
-                if (is_3d) {
-                    // 3D: Use worst-case input and disturbance (original efficient approach)
-                    std::vector<int> u_idx = {1};  // minimum input
-                    std::vector<int> w_idx = {static_cast<int>(w_numCells[0])};  // maximum disturbance
-                    
-                    auto x_plus_idx = getTransitionState(x_idx, u_idx, w_idx);
-                    if (!xInSafeSet(x_plus_idx)) {
-                        unsafe_basis_indices.push_back(x_idx);
+                auto process_basis = [&](size_t start, size_t end) {
+                    for (size_t i = start; i < end; ++i) {
+                        auto x_idx = getBasisIdx(i);
+                        auto x_val = getPriorityStateAtIdx(x_idx);
+                        
+                        bool is_unsafe = false;
+                        
+                        if (is_3d) {
+                            // 3D: Use worst-case input and disturbance (original efficient approach)
+                            std::vector<int> u_idx = {1};  // minimum input
+                            std::vector<int> w_idx = {static_cast<int>(w_numCells[0])};  // maximum disturbance
+                            
+                            auto x_plus_idx = getTransitionState(x_idx, u_idx, w_idx);
+                            if (!xInSafeSet(x_plus_idx)) {
+                                is_unsafe = true;
+                            }
+                        } else {
+                            // 2D: Use MATLAB algorithm - specific input/disturbance selection
+                            double velocity = x_val[1];
+                            
+                            // Use maximum braking force: u_val = max(a_min, -10*velocity)
+                            double u_val = std::max(U_MIN_2D, -10.0 * velocity);
+                            auto u_val_vec = getPriorityInputAtIdx({1}); // Get input at index 1
+                            u_val_vec[0] = u_val;
+                            auto u_idx = getInputIdx(u_val_vec);
+                            
+                            // Lead vehicle not moving: w_val = v_min
+                            double w_val = V_MIN_2D;
+                            auto w_val_vec = getPriorityDisturbanceAtIdx({1}); // Get disturbance at index 1
+                            w_val_vec[0] = w_val;
+                            auto w_idx = getDisturbanceIdx(w_val_vec);
+                            
+                            auto x_plus_idx = getTransitionState(x_idx, u_idx, w_idx);
+                            
+                            // Analytical safety check: stop_dist = headway - velocity^2/(2*abs(u_val))
+                            double headway = x_val[0];
+                            double stop_dist = headway - (velocity * velocity) / (2.0 * std::abs(u_val));
+                            bool should_be_safe = (stop_dist >= 5.0);
+                            
+                            if (!xInSafeSet(x_plus_idx)) {
+                                is_unsafe = true;
+                                if (should_be_safe) {
+                                    std::lock_guard<std::mutex> lock(unsafe_mutex);
+                                    std::cout << "Warning: Point should be safe! stop_dist=" << stop_dist << std::endl;
+                                }
+                            }
+                        }
+                        
+                        unsafe_flags[i] = is_unsafe;
                     }
-                } else {
-                    // 2D: Use MATLAB algorithm - specific input/disturbance selection
-                    double headway = x_val[0];
-                    double velocity = x_val[1];
+                };
+                
+                // Create threads
+                unsigned int num_threads = std::thread::hardware_concurrency();
+                if (num_threads == 0) num_threads = 4;
+                
+                std::vector<std::thread> threads;
+                size_t chunk_size = basis_size / num_threads;
+                
+                for (unsigned int t = 0; t < num_threads; ++t) {
+                    size_t start = t * chunk_size;
+                    size_t end = (t == num_threads - 1) ? basis_size : (t + 1) * chunk_size;
+                    threads.emplace_back(process_basis, start, end);
+                }
+                
+                // Wait for all threads to complete
+                for (auto& thread : threads) {
+                    thread.join();
+                }
+                
+                // Collect unsafe basis indices
+                for (size_t i = 0; i < basis_size; ++i) {
+                    if (unsafe_flags[i]) {
+                        unsafe_basis_indices.push_back(getBasisIdx(i));
+                    }
+                }
+            } else {
+                // Sequential processing (original algorithm)
+                for (size_t i = 0; i < getBasisSize(); ++i) {
+                    auto x_idx = getBasisIdx(i);
+                    auto x_val = getPriorityStateAtIdx(x_idx);
                     
-                    // Use maximum braking force: u_val = max(a_min, -10*velocity)
-                    double u_val = std::max(U_MIN_2D, -10.0 * velocity);
-                    auto u_val_vec = getPriorityInputAtIdx({1}); // Get input at index 1
-                    u_val_vec[0] = u_val;
-                    auto u_idx = getInputIdx(u_val_vec);
-                    
-                    // Lead vehicle not moving: w_val = v_min
-                    double w_val = V_MIN_2D;
-                    auto w_val_vec = getPriorityDisturbanceAtIdx({1}); // Get disturbance at index 1
-                    w_val_vec[0] = w_val;
-                    auto w_idx = getDisturbanceIdx(w_val_vec);
-                    
-                    auto x_plus_idx = getTransitionState(x_idx, u_idx, w_idx);
-                    
-                    // Analytical safety check: stop_dist = headway - velocity^2/(2*abs(u_val))
-                    double stop_dist = headway - (velocity * velocity) / (2.0 * std::abs(u_val));
-                    bool should_be_safe = (stop_dist >= 5.0);
-                    
-                    if (!xInSafeSet(x_plus_idx)) {
-                        unsafe_basis_indices.push_back(x_idx);
-                        if (should_be_safe) {
-                            std::cout << "Warning: Point should be safe! stop_dist=" << stop_dist << std::endl;
+                    if (is_3d) {
+                        // 3D: Use worst-case input and disturbance (original efficient approach)
+                        std::vector<int> u_idx = {1};  // minimum input
+                        std::vector<int> w_idx = {static_cast<int>(w_numCells[0])};  // maximum disturbance
+                        
+                        auto x_plus_idx = getTransitionState(x_idx, u_idx, w_idx);
+                        if (!xInSafeSet(x_plus_idx)) {
+                            unsafe_basis_indices.push_back(x_idx);
+                        }
+                    } else {
+                        // 2D: Use MATLAB algorithm - specific input/disturbance selection
+                        double headway = x_val[0];
+                        double velocity = x_val[1];
+                        
+                        // Use maximum braking force: u_val = max(a_min, -10*velocity)
+                        double u_val = std::max(U_MIN_2D, -10.0 * velocity);
+                        auto u_val_vec = getPriorityInputAtIdx({1}); // Get input at index 1
+                        u_val_vec[0] = u_val;
+                        auto u_idx = getInputIdx(u_val_vec);
+                        
+                        // Lead vehicle not moving: w_val = v_min
+                        double w_val = V_MIN_2D;
+                        auto w_val_vec = getPriorityDisturbanceAtIdx({1}); // Get disturbance at index 1
+                        w_val_vec[0] = w_val;
+                        auto w_idx = getDisturbanceIdx(w_val_vec);
+                        
+                        auto x_plus_idx = getTransitionState(x_idx, u_idx, w_idx);
+                        
+                        // Analytical safety check: stop_dist = headway - velocity^2/(2*abs(u_val))
+                        double stop_dist = headway - (velocity * velocity) / (2.0 * std::abs(u_val));
+                        bool should_be_safe = (stop_dist >= 5.0);
+                        
+                        if (!xInSafeSet(x_plus_idx)) {
+                            unsafe_basis_indices.push_back(x_idx);
+                            if (should_be_safe) {
+                                std::cout << "Warning: Point should be safe! stop_dist=" << stop_dist << std::endl;
+                            }
                         }
                     }
                 }
@@ -432,7 +545,7 @@ public:
             }
         }
         
-        std::cout << "Safe set computation completed in " << iter << " iterations." << std::endl;
+        std::cout << (use_parallel ? "Parallel" : "Sequential") << " safe set computation completed in " << iter << " iterations." << std::endl;
         std::cout << "Final safe set has " << getBasisSize() << " basis elements." << std::endl;
     }
     
@@ -476,17 +589,21 @@ private:
 };
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        std::cout << "Usage: " << argv[0] << " [2d|3d] [precomp|noprecomp]" << std::endl;
+    if (argc != 4) {
+        std::cout << "Usage: " << argv[0] << " [2d|3d] [precomp|noprecomp] [seq|parallel]" << std::endl;
         std::cout << "  precomp    - Enable precomputation (3D only)" << std::endl;
         std::cout << "  noprecomp  - Disable precomputation" << std::endl;
+        std::cout << "  seq        - Sequential computation" << std::endl;
+        std::cout << "  parallel   - Parallel computation" << std::endl;
         return 1;
     }
     
     std::string mode = argv[1];
     std::string precomp = argv[2];
+    std::string exec_mode = argv[3];
     bool is_3d = (mode == "3d");
     bool use_precomp = (precomp == "precomp");
+    bool use_parallel = (exec_mode == "parallel");
     
     if (mode != "2d" && mode != "3d") {
         std::cout << "Error: Mode must be '2d' or '3d'" << std::endl;
@@ -498,25 +615,36 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
+    if (exec_mode != "seq" && exec_mode != "parallel") {
+        std::cout << "Error: Execution mode must be 'seq' or 'parallel'" << std::endl;
+        return 1;
+    }
+    
     std::cout << "=== " << (is_3d ? "3D" : "2D") << " Safe Set Computation for Vehicle Following ===" << std::endl;
-    std::cout << "Computing invariant safe sets using monotone abstractions..." << std::endl;
+    std::cout << "Computing invariant safe sets using " << (use_parallel ? "parallel" : "sequential") << " monotone abstractions..." << std::endl;
     
     auto start_time = std::chrono::high_resolution_clock::now();
     
-    // Create dynamics and abstraction
-    MonotoneDynamics dyn(is_3d ? 3 : 2, 1, 1, is_3d ? DT_3D : DT_2D, is_3d);
-    MonotoneAbstraction abs(dyn, is_3d);
-    abs.setupRanges();
-    abs.initializeSafeSet();
-    abs.precomputeBoundary(use_precomp);
-    abs.computeSafeSet();
-    
-    auto end_time = std::chrono::high_resolution_clock::now();
-    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
-    
-    std::cout << "\nComputation completed in " << duration.count() << " ms" << std::endl;
-    abs.printSafeSet();
-    std::cout << "\n=== Safe Set Computation Complete ===" << std::endl;
+    try {
+        // Create dynamics and abstraction
+        MonotoneDynamics dyn(is_3d ? 3 : 2, 1, 1, is_3d ? DT_3D : DT_2D, is_3d);
+        MonotoneAbstraction abs(dyn, is_3d, use_parallel);
+        abs.setupRanges();
+        abs.initializeSafeSet();
+        abs.precomputeBoundary(use_precomp);
+        abs.computeSafeSet();
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        
+        std::cout << "\n" << (use_parallel ? "Parallel" : "Sequential") << " computation completed in " << duration.count() << " ms" << std::endl;
+        abs.printSafeSet();
+        std::cout << "\n=== Safe Set Computation Complete ===" << std::endl;
+        
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }
     
     return 0;
 }
