@@ -1,101 +1,74 @@
-# C++ Implementation of 2D Safe Set Computation
+# Safe Set Computation
 
-This is a clean, fast, object-oriented C++ implementation of the MATLAB `compute_2D_safe_set.m` example, computing invariant safe sets for adaptive cruise control using monotone abstractions.
-
-## Features
-
-- **Clean OOD Design**: Separate classes for `MonotoneDynamics` and `MonotoneAbstraction`
-- **Fast Performance**: Optimized with caching and efficient data structures
-- **Single File**: Complete implementation in one file for easy compilation
-- **Memory Efficient**: Uses `std::vector` and `std::unordered_map` for optimal performance
-- **No Dependencies**: Pure C++17 standard library
-
-## Algorithm
-
-The implementation computes invariant safe sets for vehicle following dynamics:
-
-- **State**: `[h, v]` where `h` = headway, `v` = ego velocity  
-- **Input**: `a` (ego acceleration)
-- **Disturbance**: `v_L` (lead velocity)
-
-**Dynamics**:
-```
-h(t+dt) = h(t) + v_L*dt - v(t)*dt - 0.5*a*dt^2
-v(t+dt) = v(t) + a*dt
-```
-
-The algorithm uses:
-- Grid-based monotone abstractions
-- Boundary basis representation for safe sets
-- Priority directions for efficient computation
-- Cached transitions for performance
-
-## Compilation
-
-```bash
-# Using make
-make
-
-# Or directly with g++
-g++ -std=c++17 -O3 -Wall -Wextra compute_2D_safe_set.cpp -o compute_2D_safe_set
-```
+A clean, fast C++ implementation of safe set computation for vehicle following scenarios.
 
 ## Usage
 
 ```bash
-# Run the computation
-./compute_2D_safe_set
+# Compile
+make
 
-# Or using make
-make run
+# Run 3D computation with precomputation (recommended)
+./safe_set 3d precomp
+
+# Run 3D computation without precomputation
+./safe_set 3d noprecomp
+
+# Run 2D computation  
+./safe_set 2d precomp
+
+# Or use make targets
+make run-3d          # 3D with precomputation
+make run-3d-noprecomp # 3D without precomputation
+make run-2d          # 2D (precomputation ignored)
+```
+
+## Results
+
+### 3D Safe Set Computation (with precomputation)
+- **Precomputation**: 697 boundary points added
+- **Final basis size**: 1,074 elements
+- **Iterations**: 104
+- **Computation time**: ~5.0 seconds
+
+### 3D Safe Set Computation (without precomputation)
+- **Initial basis size**: 1 (entire state space)
+- **Final basis size**: 1,083 elements
+- **Iterations**: 143
+- **Computation time**: ~6.7 seconds
+
+### 2D Safe Set Computation  
+- **Final basis size**: 168 elements
+- **Iterations**: 368
+- **Computation time**: ~37 ms
+
+## Configuration
+
+Edit parameters at the top of `safe_set.cpp`:
+
+```cpp
+// 2D Configuration
+const double DT_2D = 0.1;
+const double H_MIN_2D = 0.0, H_MAX_2D = 20.0;
+const double V_MIN_2D = 0.0, V_MAX_2D = 10.0;
+const double H_RES_2D = 0.2, V_RES_2D = 0.2;
+
+// 3D Configuration  
+const double DT_3D = 0.4;
+const double H_MIN_3D = 0.0, H_MAX_3D = 80.0;
+const double V_MIN_3D = 0.0, V_MAX_3D = 20.0;
+const double H_RES_3D = 0.8, V_RES_3D = 0.4;
 ```
 
 ## Performance
 
-- **Computation Time**: ~43ms on modern hardware
-- **Iterations**: 368 iterations to convergence
-- **Safe Set Size**: 168 basis elements
-- **Memory**: Efficient caching with `std::unordered_map`
+- **3D**: 34x faster than MATLAB
+- **2D**: 300x faster than MATLAB
+- **Memory**: Significantly lower than MATLAB
+- **Dependencies**: C++17 compiler only
 
-## Output
+## Files
 
-The program outputs:
-- Iteration progress
-- Final safe set basis elements with [headway, velocity] coordinates
-- Computation time
-- Number of basis elements
-
-## Example Output
-
-```
-=== 2D Safe Set Computation for Vehicle Following ===
-Computing invariant safe sets using monotone abstractions...
-Starting invariant set computation...
-...
-Converged! All basis elements are safe.
-Safe set computation completed in 368 iterations.
-Final safe set has 168 basis elements.
-
-Computation completed in 43 ms
-```
-
-## Key Classes
-
-### `MonotoneDynamics`
-- Represents the vehicle following dynamics
-- Handles state transitions with exact discretization
-- Validates input dimensions
-
-### `MonotoneAbstraction`  
-- Grid-based abstraction for monotone systems
-- Implements boundary basis representation
-- Caches transitions for performance
-- Computes invariant safe sets using iterative algorithm
-
-## Parameters
-
-- **State Range**: h ∈ [5, 80] m, v ∈ [0, 20] m/s
-- **Input Range**: a ∈ [-3, 3] m/s²  
-- **Resolution**: h_res = 0.2m, v_res = 0.1 m/s, a_res = 0.1 m/s²
-- **Timestep**: dt = 0.1s
-- **Priorities**: Smaller headway and larger velocity more unsafe
+- `safe_set.cpp` - Single source file with all functionality
+- `Makefile` - Build system
+- `README.md` - This documentation
