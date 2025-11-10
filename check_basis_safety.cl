@@ -1,64 +1,47 @@
-// OpenCL kernel for checking basis safety with bitmap early-exit optimization
-#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable
-
-inline bool getBit(global const uchar* bitmap, int idx) {
-    return (bitmap[idx / 8] & (1 << (idx % 8))) != 0;
-}
-
-inline void setBit(global uchar* bitmap, int idx) {
-    int byte_idx = idx / 8;
-    int bit_idx = idx % 8;
-    // Use atomic_or on int-aligned address for portability (works on macOS and Linux)
-    int word_idx = byte_idx / 4;
-    int shift = (byte_idx % 4) * 8 + bit_idx;
-    atom_or((global int*)(bitmap + word_idx * 4), (1 << shift));
-}
+// OpenCL kernel for checking basis safety directly over the basis list
 
 kernel void check_basis_safety(
-    global const uchar* basis_bitmap,        // Input: which states are in basis (1 bit per state)
-    global const int* next_state_table,      // Input: precomputed transitions (total_states * 3)
-    global const int* basis_list,            // Input: basis element coordinates (basis_size * state_dim)
-    int basis_list_size,                     // Input: number of basis elements
-    global uchar* unsafe_bitmap,             // Output: which basis states are unsafe
+    global const int* basis_flat_idx,        // Flattened indices of basis elements
+    global const int* next_state_table,      // Precomputed transitions (total_states * 3)
+    global const int* basis_list,            // Basis element coordinates (basis_size * state_dim)
+    int basis_list_size,                     // Number of basis elements
+    global int* unsafe_flags,                // Output: 1 if unsafe, 0 otherwise
     int total_states,
     int state_dim
 ) {
-    int state_idx = get_global_id(0);
-    
-    if (state_idx >= total_states) return;
-    
-    // Early exit: skip if not in basis
-    if (!getBit(basis_bitmap, state_idx)) return;
-    
-    // Get next state from transition table (stored with stride 3)
-    int next_state[3];  // MAX_STATE_DIM = 3
-    for (int i = 0; i < state_dim; ++i) {
-        next_state[i] = next_state_table[state_idx * 3 + i];
-    }
-    
-    // Check if next_state is invalid
-    if (next_state[0] == -1) {
-        setBit(unsafe_bitmap, state_idx);
+    int basis_idx = get_global_id(0);
+    if (basis_idx >= basis_list_size) return;
+
+    int flat_idx = basis_flat_idx[basis_idx];
+    if (flat_idx < 0 || flat_idx >= total_states) {
+        unsafe_flags[basis_idx] = 1;
         return;
     }
-    
-    // Check if next_state is dominated by any basis element
-    bool safe = false;
+
+    int next_state[3] = {0, 0, 0};  // MAX_STATE_DIM = 3
+    for (int i = 0; i < state_dim; ++i) {
+        next_state[i] = next_state_table[flat_idx * 3 + i];
+    }
+
+    if (next_state[0] == -1) {
+        unsafe_flags[basis_idx] = 1;
+        return;
+    }
+
+    int unsafe = 1;
     for (int i = 0; i < basis_list_size; ++i) {
-        bool dominated = true;
+        int dominated = 1;
         for (int j = 0; j < state_dim; ++j) {
             if (next_state[j] > basis_list[i * state_dim + j]) {
-                dominated = false;
+                dominated = 0;
                 break;
             }
         }
         if (dominated) {
-            safe = true;
+            unsafe = 0;
             break;
         }
     }
-    
-    if (!safe) {
-        setBit(unsafe_bitmap, state_idx);
-    }
+
+    unsafe_flags[basis_idx] = unsafe;
 }

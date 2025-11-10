@@ -53,18 +53,6 @@ void checkError(cl_int error, const char* message) {
     }
 }
 
-inline void setBit(unsigned char* bitmap, int idx) {
-    bitmap[idx / 8] |= (1 << (idx % 8));
-}
-
-inline bool getBit(const unsigned char* bitmap, int idx) {
-    return (bitmap[idx / 8] & (1 << (idx % 8))) != 0;
-}
-
-inline void clearBit(unsigned char* bitmap, int idx) {
-    bitmap[idx / 8] &= ~(1 << (idx % 8));
-}
-
 // ============================================================================
 // CORE IMPLEMENTATION
 // ============================================================================
@@ -78,9 +66,8 @@ private:
     
     int safe_set_basis[MAX_BASIS_ELEMENTS * MAX_STATE_DIM];
     int safe_set_size;
-    
-    unsigned char* basis_bitmap;
-    int bitmap_size;
+    int safe_set_flat_indices[MAX_BASIS_ELEMENTS];
+    int flatten_multipliers[MAX_STATE_DIM];
     int total_states;
     
     int* next_state_table;
@@ -97,18 +84,19 @@ private:
     cl_kernel kernel_trans, kernel_safety;
     
 public:
-    MonotoneAbstraction(bool use_3d) 
-        : safe_set_size(0), is_3d(use_3d), basis_bitmap(nullptr), next_state_table(nullptr),
-          platform(nullptr), device(nullptr), context(nullptr), queue(nullptr), 
+        MonotoneAbstraction(bool use_3d) 
+                : safe_set_size(0), is_3d(use_3d), next_state_table(nullptr),
+                    platform(nullptr), device(nullptr), context(nullptr), queue(nullptr), 
           program_trans(nullptr), program_safety(nullptr), kernel_trans(nullptr), kernel_safety(nullptr) {
         memset(safe_set_basis, 0, sizeof(safe_set_basis));
+                memset(safe_set_flat_indices, 0, sizeof(safe_set_flat_indices));
+                memset(flatten_multipliers, 0, sizeof(flatten_multipliers));
         max_grid_size = is_3d ? MAX_GRID_SIZE_3D : MAX_GRID_SIZE_2D;
         dt = is_3d ? DT_3D : DT_2D;
     }
     
     ~MonotoneAbstraction() {
         if (next_state_table) delete[] next_state_table;
-        if (basis_bitmap) delete[] basis_bitmap;
         if (kernel_trans) clReleaseKernel(kernel_trans);
         if (kernel_safety) clReleaseKernel(kernel_safety);
         if (program_trans) clReleaseProgram(program_trans);
@@ -141,9 +129,10 @@ public:
             total_states *= x_numCells[i];
         }
         
-        bitmap_size = (total_states + 7) / 8;
-        basis_bitmap = new unsigned char[bitmap_size];
-        memset(basis_bitmap, 0, bitmap_size);
+        flatten_multipliers[0] = 1;
+        for (int i = 1; i < state_dim; ++i) {
+            flatten_multipliers[i] = flatten_multipliers[i - 1] * x_numCells[i - 1];
+        }
     }
     
     void initializeOpenCL() {
@@ -161,7 +150,7 @@ public:
         context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
         checkError(err, "Failed to create context");
         
-        queue = clCreateCommandQueue(context, device, 0, &err);
+    queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
         checkError(err, "Failed to create command queue");
         
         // Load transition kernel
@@ -259,9 +248,17 @@ public:
         size_t local_work_size = 256;
         global_work_size = ((global_work_size + local_work_size - 1) / local_work_size) * local_work_size;
         
-        clEnqueueNDRangeKernel(queue, kernel_trans, 1, nullptr, &global_work_size, &local_work_size, 0, nullptr, nullptr);
+        cl_event trans_event;
+        clEnqueueNDRangeKernel(queue, kernel_trans, 1, nullptr, &global_work_size, &local_work_size, 0, nullptr, &trans_event);
+        clWaitForEvents(1, &trans_event);
         clEnqueueReadBuffer(queue, d_next_state_table, CL_TRUE, 0,
             sizeof(int) * total_states * MAX_STATE_DIM, next_state_table, 0, nullptr, nullptr);
+    cl_ulong trans_start = 0, trans_end = 0;
+    clGetEventProfilingInfo(trans_event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &trans_start, nullptr);
+    clGetEventProfilingInfo(trans_event, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &trans_end, nullptr);
+    double trans_ms = (trans_end - trans_start) * 1e-6;
+        clReleaseEvent(trans_event);
+    std::cout << "Transition kernel: " << trans_ms << " ms" << std::endl;
         
         clReleaseMemObject(d_x_range_min);
         clReleaseMemObject(d_x_range_max);
@@ -287,30 +284,14 @@ public:
             safe_set_basis[safe_set_size * MAX_STATE_DIM + i] = x_numCells[i];
         }
         safe_set_size = 1;
-        buildBitmapFromBasis();
-    }
-    
-    void buildBitmapFromBasis() {
-        memset(basis_bitmap, 0, bitmap_size);
-        int state_dim = is_3d ? 3 : 2;
-        
-        // Only mark the actual basis elements (not all dominated states)
-        // This makes early-exit extremely effective (~1000 threads vs 262K threads)
-        for (int i = 0; i < safe_set_size; ++i) {
-            int flat_idx = 0, multiplier = 1;
-            for (int j = 0; j < state_dim; ++j) {
-                flat_idx += (safe_set_basis[i * MAX_STATE_DIM + j] - 1) * multiplier;
-                multiplier *= x_numCells[j];
-            }
-            setBit(basis_bitmap, flat_idx);
-        }
+        safe_set_flat_indices[0] = flattenIndex(&safe_set_basis[0]);
     }
     
     bool xInSafeSet(const int* x_idx) const {
         if (x_idx[0] == -1) return false;
         
         int state_dim = is_3d ? 3 : 2;
-        for (int i = 0; i < safe_set_size; ++i) {
+        for (int i = safe_set_size - 1; i >= 0; --i) {
             bool dominated = true;
             for (int j = 0; j < state_dim; ++j) {
                 if (x_idx[j] > safe_set_basis[i * MAX_STATE_DIM + j]) {
@@ -326,71 +307,88 @@ public:
     void computeSafeSetGPU() {
         int iter = 0;
         int state_dim = is_3d ? 3 : 2;
-        
-        // Create GPU buffers once (reuse across iterations)
+
         cl_int err;
-        cl_mem d_basis_bitmap = clCreateBuffer(context, CL_MEM_READ_ONLY, bitmap_size, nullptr, &err);
         cl_mem d_next_state_table = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             sizeof(int) * total_states * MAX_STATE_DIM, next_state_table, &err);
-        cl_mem d_basis_list = clCreateBuffer(context, CL_MEM_READ_ONLY, 
+        cl_mem d_basis_list = clCreateBuffer(context, CL_MEM_READ_ONLY,
             sizeof(int) * MAX_BASIS_ELEMENTS * MAX_STATE_DIM, nullptr, &err);
-        cl_mem d_unsafe_bitmap = clCreateBuffer(context, CL_MEM_READ_WRITE, bitmap_size, nullptr, &err);
-        
-        unsigned char* unsafe_bitmap = new unsigned char[bitmap_size];
-        
-        // Pre-allocate fixed arrays (avoid vector allocations)
+        cl_mem d_basis_flat = clCreateBuffer(context, CL_MEM_READ_ONLY,
+            sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
+        cl_mem d_unsafe_flags = clCreateBuffer(context, CL_MEM_READ_WRITE,
+            sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
+
+    int unsafe_flags[MAX_BASIS_ELEMENTS];
         int unsafe_indices[MAX_BASIS_ELEMENTS];
         int neighbor_buffer[MAX_BASIS_ELEMENTS * MAX_STATE_DIM * MAX_STATE_DIM];
-        
-        size_t local_work_size = 256;
-        size_t global_work_size = ((total_states + local_work_size - 1) / local_work_size) * local_work_size;
-        
-        // Set constant kernel args once
+    unsigned char unsafe_mask[MAX_BASIS_ELEMENTS];
+
+        size_t local_work_size = 128;
+
+        clSetKernelArg(kernel_safety, 0, sizeof(cl_mem), &d_basis_flat);
         clSetKernelArg(kernel_safety, 1, sizeof(cl_mem), &d_next_state_table);
+        clSetKernelArg(kernel_safety, 2, sizeof(cl_mem), &d_basis_list);
+        clSetKernelArg(kernel_safety, 4, sizeof(cl_mem), &d_unsafe_flags);
         clSetKernelArg(kernel_safety, 5, sizeof(int), &total_states);
         clSetKernelArg(kernel_safety, 6, sizeof(int), &state_dim);
-        
+
+        double total_upload_ms = 0.0;
+        double total_kernel_ms = 0.0;
+        double total_read_ms = 0.0;
+        double total_cpu_ms = 0.0;
+
         while (true) {
             iter++;
             if (safe_set_size == 0) break;
-            
-            // Phase 1: GPU marks unsafe states
-            memset(unsafe_bitmap, 0, bitmap_size);  // Clear bitmap - kernel only sets bits, never clears
-            
-            clEnqueueWriteBuffer(queue, d_basis_bitmap, CL_FALSE, 0, bitmap_size, basis_bitmap, 0, nullptr, nullptr);
-            clEnqueueWriteBuffer(queue, d_basis_list, CL_FALSE, 0, 
-                sizeof(int) * safe_set_size * MAX_STATE_DIM, safe_set_basis, 0, nullptr, nullptr);
-            clEnqueueWriteBuffer(queue, d_unsafe_bitmap, CL_FALSE, 0, bitmap_size, unsafe_bitmap, 0, nullptr, nullptr);
-            
-            clSetKernelArg(kernel_safety, 0, sizeof(cl_mem), &d_basis_bitmap);
-            clSetKernelArg(kernel_safety, 2, sizeof(cl_mem), &d_basis_list);
-            clSetKernelArg(kernel_safety, 3, sizeof(int), &safe_set_size);
-            clSetKernelArg(kernel_safety, 4, sizeof(cl_mem), &d_unsafe_bitmap);
-            
-            clEnqueueNDRangeKernel(queue, kernel_safety, 1, nullptr, &global_work_size, &local_work_size, 0, nullptr, nullptr);
-            clEnqueueReadBuffer(queue, d_unsafe_bitmap, CL_TRUE, 0, bitmap_size, unsafe_bitmap, 0, nullptr, nullptr);
-            
-            // Phase 2: CPU identifies unsafe basis elements (use fixed array)
-            int unsafe_count = 0;
-            for (int i = 0; i < safe_set_size; ++i) {
-                int flat_idx = 0, multiplier = 1;
-                for (int j = 0; j < state_dim; ++j) {
-                    flat_idx += (safe_set_basis[i * MAX_STATE_DIM + j] - 1) * multiplier;
-                    multiplier *= x_numCells[j];
-                }
-                if (getBit(unsafe_bitmap, flat_idx)) {
-                    unsafe_indices[unsafe_count++] = i;
-                }
+
+            size_t basis_bytes = sizeof(int) * safe_set_size * state_dim;
+            size_t flat_bytes = sizeof(int) * safe_set_size;
+
+            auto upload_start = std::chrono::high_resolution_clock::now();
+            cl_event write_events[2];
+            clEnqueueWriteBuffer(queue, d_basis_list, CL_FALSE, 0, basis_bytes, safe_set_basis, 0, nullptr, &write_events[0]);
+            clEnqueueWriteBuffer(queue, d_basis_flat, CL_FALSE, 0, flat_bytes, safe_set_flat_indices, 0, nullptr, &write_events[1]);
+            clWaitForEvents(2, write_events);
+            auto upload_end = std::chrono::high_resolution_clock::now();
+            total_upload_ms += std::chrono::duration<double, std::milli>(upload_end - upload_start).count();
+            for (int we = 0; we < 2; ++we) {
+                clReleaseEvent(write_events[we]);
             }
-            
-            // Phase 3: Collect neighbors from unsafe bases (use fixed array)
+
+            clSetKernelArg(kernel_safety, 3, sizeof(int), &safe_set_size);
+
+            size_t global_work_size = ((safe_set_size + local_work_size - 1) / local_work_size) * local_work_size;
+            cl_event safety_event;
+            clEnqueueNDRangeKernel(queue, kernel_safety, 1, nullptr, &global_work_size, &local_work_size, 0, nullptr, &safety_event);
+            clWaitForEvents(1, &safety_event);
+            cl_ulong safety_start = 0, safety_end = 0;
+            clGetEventProfilingInfo(safety_event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &safety_start, nullptr);
+            clGetEventProfilingInfo(safety_event, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &safety_end, nullptr);
+            total_kernel_ms += (safety_end - safety_start) * 1e-6;
+            clReleaseEvent(safety_event);
+
+            auto read_start = std::chrono::high_resolution_clock::now();
+            clEnqueueReadBuffer(queue, d_unsafe_flags, CL_TRUE, 0, flat_bytes, unsafe_flags, 0, nullptr, nullptr);
+            auto read_end = std::chrono::high_resolution_clock::now();
+            total_read_ms += std::chrono::duration<double, std::milli>(read_end - read_start).count();
+
+            auto cpu_start = std::chrono::high_resolution_clock::now();
+
+            std::fill_n(unsafe_mask, safe_set_size, static_cast<unsigned char>(0));
+
+            int unsafe_count = 0;
             int neighbor_count = 0;
-            for (int ui = 0; ui < unsafe_count; ++ui) {
-                int idx = unsafe_indices[ui];
+            for (int i = 0; i < safe_set_size; ++i) {
+                if (!unsafe_flags[i]) continue;
+
+                unsafe_indices[unsafe_count++] = i;
+                unsafe_mask[i] = 1;
+
+                int idx = i;
                 for (int j = 0; j < state_dim; ++j) {
                     int val = safe_set_basis[idx * MAX_STATE_DIM + j];
                     if (val == 1) continue;
-                    
+
                     int* neighbor = &neighbor_buffer[neighbor_count * MAX_STATE_DIM];
                     for (int k = 0; k < state_dim; ++k) {
                         neighbor[k] = safe_set_basis[idx * MAX_STATE_DIM + k] - (j == k ? 1 : 0);
@@ -398,29 +396,21 @@ public:
                     neighbor_count++;
                 }
             }
-            
-            // Remove unsafe bases (mark-and-compact)
+
             int write_pos = 0;
             for (int i = 0; i < safe_set_size; ++i) {
-                bool is_unsafe = false;
-                for (int ui = 0; ui < unsafe_count; ++ui) {
-                    if (unsafe_indices[ui] == i) {
-                        is_unsafe = true;
-                        break;
-                    }
-                }
-                if (!is_unsafe) {
+                if (!unsafe_mask[i]) {
                     if (write_pos != i) {
                         for (int j = 0; j < state_dim; ++j) {
                             safe_set_basis[write_pos * MAX_STATE_DIM + j] = safe_set_basis[i * MAX_STATE_DIM + j];
                         }
+                        safe_set_flat_indices[write_pos] = safe_set_flat_indices[i];
                     }
                     write_pos++;
                 }
             }
             safe_set_size = write_pos;
-            
-            // Add unique neighbors
+
             int added_count = 0;
             for (int ni = 0; ni < neighbor_count; ++ni) {
                 int* neighbor = &neighbor_buffer[ni * MAX_STATE_DIM];
@@ -429,22 +419,28 @@ public:
                     for (int j = 0; j < state_dim; ++j) {
                         safe_set_basis[safe_set_size * MAX_STATE_DIM + j] = neighbor[j];
                     }
+                    safe_set_flat_indices[safe_set_size] = flattenIndex(neighbor);
                     safe_set_size++;
                     added_count++;
                 }
             }
-            
-            if (added_count == 0) break;
-            buildBitmapFromBasis();
+
+            auto cpu_end = std::chrono::high_resolution_clock::now();
+            total_cpu_ms += std::chrono::duration<double, std::milli>(cpu_end - cpu_start).count();
+
+            if (added_count == 0) {
+                break;
+            }
         }
-        
-        delete[] unsafe_bitmap;
-        clReleaseMemObject(d_basis_bitmap);
+
         clReleaseMemObject(d_next_state_table);
         clReleaseMemObject(d_basis_list);
-        clReleaseMemObject(d_unsafe_bitmap);
-        
+        clReleaseMemObject(d_basis_flat);
+        clReleaseMemObject(d_unsafe_flags);
+
         std::cout << "Converged in " << iter << " iterations with " << safe_set_size << " basis elements" << std::endl;
+        std::cout << "Uploads: " << total_upload_ms << " ms, Kernel: " << total_kernel_ms
+                  << " ms, Readback: " << total_read_ms << " ms, CPU update: " << total_cpu_ms << " ms" << std::endl;
     }
     
     void printSafeSet(int max_elements = 10) const {
