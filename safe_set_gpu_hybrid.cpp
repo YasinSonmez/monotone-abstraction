@@ -57,6 +57,16 @@ void checkError(cl_int error, const char* message) {
 // CORE IMPLEMENTATION
 // ============================================================================
 
+struct ComputeStats {
+    int iterations;
+    int basis_elements;
+    double upload_ms;
+    double kernel_ms;
+    double readback_ms;
+    double cpu_ms;
+    double total_ms;
+};
+
 class MonotoneAbstraction {
 private:
     double x_range_min[MAX_STATE_DIM], x_range_max[MAX_STATE_DIM];
@@ -304,7 +314,7 @@ public:
         return false;
     }
     
-    void computeSafeSetGPU() {
+    ComputeStats computeSafeSetGPU() {
         int iter = 0;
         int state_dim = is_3d ? 3 : 2;
 
@@ -322,6 +332,7 @@ public:
         int unsafe_indices[MAX_BASIS_ELEMENTS];
         int neighbor_buffer[MAX_BASIS_ELEMENTS * MAX_STATE_DIM * MAX_STATE_DIM];
     unsigned char unsafe_mask[MAX_BASIS_ELEMENTS];
+        unsigned char* seen_neighbors = new unsigned char[total_states];
 
         size_t local_work_size = 128;
 
@@ -336,6 +347,8 @@ public:
         double total_kernel_ms = 0.0;
         double total_read_ms = 0.0;
         double total_cpu_ms = 0.0;
+        
+        auto compute_start = std::chrono::high_resolution_clock::now();
 
         while (true) {
             iter++;
@@ -375,6 +388,7 @@ public:
             auto cpu_start = std::chrono::high_resolution_clock::now();
 
             std::fill_n(unsafe_mask, safe_set_size, static_cast<unsigned char>(0));
+            memset(seen_neighbors, 0, total_states);
 
             int unsafe_count = 0;
             int neighbor_count = 0;
@@ -389,11 +403,20 @@ public:
                     int val = safe_set_basis[idx * MAX_STATE_DIM + j];
                     if (val == 1) continue;
 
-                    int* neighbor = &neighbor_buffer[neighbor_count * MAX_STATE_DIM];
+                    int neighbor_coords[MAX_STATE_DIM];
                     for (int k = 0; k < state_dim; ++k) {
-                        neighbor[k] = safe_set_basis[idx * MAX_STATE_DIM + k] - (j == k ? 1 : 0);
+                        neighbor_coords[k] = safe_set_basis[idx * MAX_STATE_DIM + k] - (j == k ? 1 : 0);
                     }
-                    neighbor_count++;
+                    
+                    int flat_idx = flattenIndex(neighbor_coords);
+                    if (!seen_neighbors[flat_idx]) {
+                        seen_neighbors[flat_idx] = 1;
+                        int* neighbor = &neighbor_buffer[neighbor_count * MAX_STATE_DIM];
+                        for (int k = 0; k < state_dim; ++k) {
+                            neighbor[k] = neighbor_coords[k];
+                        }
+                        neighbor_count++;
+                    }
                 }
             }
 
@@ -432,15 +455,19 @@ public:
                 break;
             }
         }
+        
+        auto compute_end = std::chrono::high_resolution_clock::now();
+        double total_compute_ms = std::chrono::duration<double, std::milli>(compute_end - compute_start).count();
 
+        delete[] seen_neighbors;
+        
         clReleaseMemObject(d_next_state_table);
         clReleaseMemObject(d_basis_list);
         clReleaseMemObject(d_basis_flat);
         clReleaseMemObject(d_unsafe_flags);
 
-        std::cout << "Converged in " << iter << " iterations with " << safe_set_size << " basis elements" << std::endl;
-        std::cout << "Uploads: " << total_upload_ms << " ms, Kernel: " << total_kernel_ms
-                  << " ms, Readback: " << total_read_ms << " ms, CPU update: " << total_cpu_ms << " ms" << std::endl;
+        return ComputeStats{iter, safe_set_size, total_upload_ms, total_kernel_ms, 
+                           total_read_ms, total_cpu_ms, total_compute_ms};
     }
     
     void printSafeSet(int max_elements = 10) const {
@@ -508,20 +535,81 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     
-    auto start_time = std::chrono::high_resolution_clock::now();
+    const int NUM_RUNS = 10;
     
     try {
         MonotoneAbstraction abs(is_3d);
+        
+        // One-time setup
+        auto setup_start = std::chrono::high_resolution_clock::now();
         abs.setupRanges();
         abs.initializeOpenCL();
         abs.precomputeNextStateTableGPU();
-        abs.initializeSafeSet();
-        abs.computeSafeSetGPU();
+        auto setup_end = std::chrono::high_resolution_clock::now();
+        double setup_ms = std::chrono::duration<double, std::milli>(setup_end - setup_start).count();
         
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+        std::cout << "\n==================================" << std::endl;
+        std::cout << "Setup phase: " << setup_ms << " ms" << std::endl;
+        std::cout << "==================================" << std::endl;
         
-        std::cout << "Total: " << duration.count() << " ms" << std::endl;
+        // Run computation 10 times
+        std::vector<ComputeStats> all_stats;
+        
+        for (int run = 0; run < NUM_RUNS; ++run) {
+            std::cout << "\n==================================" << std::endl;
+            std::cout << "Run " << (run + 1) << "/" << NUM_RUNS << std::endl;
+            std::cout << "==================================" << std::endl;
+            
+            auto run_start = std::chrono::high_resolution_clock::now();
+            abs.initializeSafeSet();
+            auto stats = abs.computeSafeSetGPU();
+            auto run_end = std::chrono::high_resolution_clock::now();
+            double run_total_ms = std::chrono::duration<double, std::milli>(run_end - run_start).count();
+            
+            all_stats.push_back(stats);
+            
+            std::cout << "  Iterations: " << stats.iterations << std::endl;
+            std::cout << "  Basis elements: " << stats.basis_elements << std::endl;
+            std::cout << "  Upload time: " << stats.upload_ms << " ms" << std::endl;
+            std::cout << "  Kernel time: " << stats.kernel_ms << " ms" << std::endl;
+            std::cout << "  Readback time: " << stats.readback_ms << " ms" << std::endl;
+            std::cout << "  CPU update time: " << stats.cpu_ms << " ms" << std::endl;
+            std::cout << "  Compute total: " << stats.total_ms << " ms" << std::endl;
+            std::cout << "  Run total (with init): " << run_total_ms << " ms" << std::endl;
+        }
+        
+        // Compute and display averages
+        std::cout << "\n==================================" << std::endl;
+        std::cout << "Summary Statistics (avg over " << NUM_RUNS << " runs)" << std::endl;
+        std::cout << "==================================" << std::endl;
+        
+        double avg_upload = 0.0, avg_kernel = 0.0, avg_readback = 0.0;
+        double avg_cpu = 0.0, avg_total = 0.0;
+        int avg_iterations = 0;
+        
+        for (const auto& stats : all_stats) {
+            avg_upload += stats.upload_ms;
+            avg_kernel += stats.kernel_ms;
+            avg_readback += stats.readback_ms;
+            avg_cpu += stats.cpu_ms;
+            avg_total += stats.total_ms;
+            avg_iterations += stats.iterations;
+        }
+        
+        avg_upload /= NUM_RUNS;
+        avg_kernel /= NUM_RUNS;
+        avg_readback /= NUM_RUNS;
+        avg_cpu /= NUM_RUNS;
+        avg_total /= NUM_RUNS;
+        avg_iterations /= NUM_RUNS;
+        
+        std::cout << "  Avg iterations: " << avg_iterations << std::endl;
+        std::cout << "  Avg upload time: " << avg_upload << " ms" << std::endl;
+        std::cout << "  Avg kernel time: " << avg_kernel << " ms" << std::endl;
+        std::cout << "  Avg readback time: " << avg_readback << " ms" << std::endl;
+        std::cout << "  Avg CPU update time: " << avg_cpu << " ms" << std::endl;
+        std::cout << "  Avg compute total: " << avg_total << " ms" << std::endl;
+        std::cout << "  Setup time: " << setup_ms << " ms" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
