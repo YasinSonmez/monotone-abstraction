@@ -45,11 +45,6 @@ void checkError(cl_int error, const char* message) {
     }
 }
 
-struct ComputeStats {
-    int iterations, basis_elements;
-    double upload_ms, kernel_ms, readback_ms, cpu_ms, total_ms;
-};
-
 // ============================================================================
 // MONOTONE ABSTRACTION
 // ============================================================================
@@ -140,7 +135,7 @@ public:
         context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &err);
         checkError(err, "Create context failed");
         
-        queue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
+        queue = clCreateCommandQueue(context, device, 0, &err);
         checkError(err, "Create queue failed");
         
         // Build kernels
@@ -226,19 +221,20 @@ public:
         }
     }
     
-    ComputeStats computeSafeSetGPU() {
-        int iter = 0;
+    double computeSafeSetGPU(int& out_iterations, int& out_basis_elements) {
+        out_iterations = 0;
         int state_dim = is_3d ? 3 : 2;
         
-        // Allocate GPU buffers
+        // Allocate GPU buffers ONCE (no reallocation overhead)
+        // Use pinned memory (CL_MEM_ALLOC_HOST_PTR) for faster transfers
         cl_int err;
         cl_mem d_next_state_table = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
             sizeof(int) * total_states * MAX_STATE_DIM, next_state_table, &err);
-        cl_mem d_basis_list = clCreateBuffer(context, CL_MEM_READ_ONLY,
+        cl_mem d_basis_list = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
             sizeof(int) * MAX_BASIS_ELEMENTS * MAX_STATE_DIM, nullptr, &err);
-        cl_mem d_basis_flat = clCreateBuffer(context, CL_MEM_READ_ONLY,
+        cl_mem d_basis_flat = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
             sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
-        cl_mem d_unsafe_flags = clCreateBuffer(context, CL_MEM_READ_WRITE,
+        cl_mem d_unsafe_flags = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR,
             sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
         
         // Allocate CPU buffers
@@ -255,52 +251,50 @@ public:
         clSetKernelArg(kernel_safety, 5, sizeof(int), &total_states);
         clSetKernelArg(kernel_safety, 6, sizeof(int), &state_dim);
         
-        // Track timing
-        double total_upload_ms = 0, total_kernel_ms = 0, total_read_ms = 0, total_cpu_ms = 0;
         auto compute_start = std::chrono::high_resolution_clock::now();
         
         // Fixed-point iteration
         while (true) {
-            iter++;
+            out_iterations++;
             if (safe_set_size == 0) break;
             
-            // Upload basis to GPU
-            auto t0 = std::chrono::high_resolution_clock::now();
-            uploadBasisToGPU(d_basis_list, d_basis_flat, state_dim);
-            auto t1 = std::chrono::high_resolution_clock::now();
-            total_upload_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+            // Pipelined GPU operations: upload -> kernel -> readback
+            size_t basis_bytes = sizeof(int) * safe_set_size * state_dim;
+            size_t flat_bytes = sizeof(int) * safe_set_size;
             
-            // Run safety kernel
+            // Async uploads
+            cl_event upload_events[2];
+            clEnqueueWriteBuffer(queue, d_basis_list, CL_FALSE, 0, basis_bytes, 
+                                safe_set_basis, 0, nullptr, &upload_events[0]);
+            clEnqueueWriteBuffer(queue, d_basis_flat, CL_FALSE, 0, flat_bytes, 
+                                safe_set_flat_indices, 0, nullptr, &upload_events[1]);
+            
+            // Kernel waits for uploads
             clSetKernelArg(kernel_safety, 3, sizeof(int), &safe_set_size);
             size_t global = ((safe_set_size + 127) / 128) * 128;
-            cl_event event;
-            clEnqueueNDRangeKernel(queue, kernel_safety, 1, nullptr, &global, nullptr, 0, nullptr, &event);
-            clWaitForEvents(1, &event);
+            cl_event kernel_event;
+            clEnqueueNDRangeKernel(queue, kernel_safety, 1, nullptr, &global, nullptr, 
+                                  2, upload_events, &kernel_event);
             
-            cl_ulong start, end;
-            clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(cl_ulong), &start, nullptr);
-            clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(cl_ulong), &end, nullptr);
-            total_kernel_ms += (end - start) * 1e-6;
-            clReleaseEvent(event);
+            // Readback waits for kernel
+            cl_event read_event;
+            clEnqueueReadBuffer(queue, d_unsafe_flags, CL_FALSE, 0, flat_bytes, 
+                               unsafe_flags, 1, &kernel_event, &read_event);
             
-            // Read results
-            auto t2 = std::chrono::high_resolution_clock::now();
-            clEnqueueReadBuffer(queue, d_unsafe_flags, CL_TRUE, 0, 
-                               sizeof(int) * safe_set_size, unsafe_flags, 0, nullptr, nullptr);
-            auto t3 = std::chrono::high_resolution_clock::now();
-            total_read_ms += std::chrono::duration<double, std::milli>(t3 - t2).count();
+            // Wait for pipeline
+            clWaitForEvents(1, &read_event);
+            clReleaseEvent(upload_events[0]);
+            clReleaseEvent(upload_events[1]);
+            clReleaseEvent(kernel_event);
+            clReleaseEvent(read_event);
             
             // Update safe set
-            auto t4 = std::chrono::high_resolution_clock::now();
             int added = updateSafeSet(unsafe_flags, unsafe_mask, seen_neighbors, neighbor_buffer, state_dim);
-            auto t5 = std::chrono::high_resolution_clock::now();
-            total_cpu_ms += std::chrono::duration<double, std::milli>(t5 - t4).count();
-            
             if (added == 0) break;
         }
         
         auto compute_end = std::chrono::high_resolution_clock::now();
-        double total_ms = std::chrono::duration<double, std::milli>(compute_end - compute_start).count();
+        out_basis_elements = safe_set_size;
         
         delete[] seen_neighbors;
         clReleaseMemObject(d_next_state_table);
@@ -308,8 +302,7 @@ public:
         clReleaseMemObject(d_basis_flat);
         clReleaseMemObject(d_unsafe_flags);
         
-        return ComputeStats{iter, safe_set_size, total_upload_ms, total_kernel_ms, 
-                           total_read_ms, total_cpu_ms, total_ms};
+        return std::chrono::duration<double, std::milli>(compute_end - compute_start).count();
     }
     
 private:
@@ -335,13 +328,6 @@ private:
         
         kern = clCreateKernel(prog, name, &err);
         checkError(err, "Create kernel failed");
-    }
-    
-    void uploadBasisToGPU(cl_mem d_basis_list, cl_mem d_basis_flat, int state_dim) {
-        clEnqueueWriteBuffer(queue, d_basis_list, CL_FALSE, 0, 
-                            sizeof(int) * safe_set_size * state_dim, safe_set_basis, 0, nullptr, nullptr);
-        clEnqueueWriteBuffer(queue, d_basis_flat, CL_TRUE, 0, 
-                            sizeof(int) * safe_set_size, safe_set_flat_indices, 0, nullptr, nullptr);
     }
     
     int updateSafeSet(int* unsafe_flags, unsigned char* unsafe_mask, 
@@ -464,32 +450,22 @@ int main(int argc, char* argv[]) {
         std::cout << "\nSetup: " << setup_ms << " ms\n" << std::endl;
         
         // Run multiple times
-        std::vector<ComputeStats> all_stats;
+        double total_time = 0;
+        int total_iter = 0;
         for (int run = 0; run < NUM_RUNS; ++run) {
-            std::cout << "Run " << (run + 1) << "/" << NUM_RUNS << std::endl;
+            std::cout << "Run " << (run + 1) << "/" << NUM_RUNS << ": ";
             abs.initializeSafeSet();
-            auto stats = abs.computeSafeSetGPU();
-            all_stats.push_back(stats);
-            
-            std::cout << "  Iter: " << stats.iterations << ", Basis: " << stats.basis_elements << std::endl;
-            std::cout << "  Upload: " << stats.upload_ms << " ms, Kernel: " << stats.kernel_ms << " ms" << std::endl;
-            std::cout << "  Read: " << stats.readback_ms << " ms, CPU: " << stats.cpu_ms << " ms" << std::endl;
-            std::cout << "  Total: " << stats.total_ms << " ms\n" << std::endl;
+            int iterations, basis_elements;
+            double time_ms = abs.computeSafeSetGPU(iterations, basis_elements);
+            total_time += time_ms;
+            total_iter += iterations;
+            std::cout << iterations << " iterations, " 
+                      << basis_elements << " basis, " 
+                      << time_ms << " ms" << std::endl;
         }
         
-        // Averages
-        std::cout << "=== Averages ===" << std::endl;
-        double avg_upload = 0, avg_kernel = 0, avg_read = 0, avg_cpu = 0, avg_total = 0;
-        for (const auto& s : all_stats) {
-            avg_upload += s.upload_ms;
-            avg_kernel += s.kernel_ms;
-            avg_read += s.readback_ms;
-            avg_cpu += s.cpu_ms;
-            avg_total += s.total_ms;
-        }
-        std::cout << "Upload: " << avg_upload / NUM_RUNS << " ms, Kernel: " << avg_kernel / NUM_RUNS << " ms" << std::endl;
-        std::cout << "Read: " << avg_read / NUM_RUNS << " ms, CPU: " << avg_cpu / NUM_RUNS << " ms" << std::endl;
-        std::cout << "Total: " << avg_total / NUM_RUNS << " ms" << std::endl;
+        std::cout << "\nAverage: " << total_iter / NUM_RUNS << " iterations, " 
+                  << total_time / NUM_RUNS << " ms" << std::endl;
         
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;
