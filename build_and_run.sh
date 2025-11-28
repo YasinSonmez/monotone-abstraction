@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 
 # Generic script to build and run C++ files with OpenCL
 # Usage: ./build_and_run.sh <cpp_file_name> <args...>
@@ -40,8 +40,10 @@ echo ""
 echo "==================================="
 echo "Compiling $CPP_SOURCE..."
 echo "==================================="
-g++ -std=c++17 -O3 -o "$EXECUTABLE" "$CPP_SOURCE" -framework OpenCL
+clang++ -std=c++17 -O3 -o "$EXECUTABLE" "$CPP_SOURCE" -framework OpenCL
 
+# I'd not call the program. This is just a build script. You could build all variants instead.
+# for me this failed with the following error: UNSUPPORTED (log once): createKernel: newComputePipelineState failed 
 echo ""
 echo "==================================="
 echo "Running: ./$EXECUTABLE $PROGRAM_ARGS"
