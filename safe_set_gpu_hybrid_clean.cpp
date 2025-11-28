@@ -17,18 +17,19 @@
 // CONFIGURATION
 // ============================================================================
 
-const double DT_2D = 0.1, DT_3D = 0.4;
-const double H_MIN_2D = 5.0, H_MAX_2D = 80.0, V_MIN_2D = 0.0, V_MAX_2D = 20.0;
-const double H_MIN_3D = 0.0, H_MAX_3D = 80.0, V_MIN_3D = 0.0, V_MAX_3D = 20.0;
-const double H_RES_2D = 0.2, V_RES_2D = 0.1, H_RES_3D = 0.8, V_RES_3D = 0.4;
+constexpr double DT_2D = 0.1, DT_3D = 0.4;
+constexpr double H_MIN_2D = 5.0, H_MAX_2D = 80.0, V_MIN_2D = 0.0, V_MAX_2D = 20.0;
+constexpr double H_MIN_3D = 0.0, H_MAX_3D = 80.0, V_MIN_3D = 0.0, V_MAX_3D = 20.0;
+constexpr double H_RES_2D = 0.2, V_RES_2D = 0.1, H_RES_3D = 0.8, V_RES_3D = 0.4;
+///TODO: @MK: instead of reading 2D/3D from command line, what about letting the user define it here as STATE_DIM instead of MAX_STATE_DIM? You could keep both logics in the code thought. I am just referring to the input.
+constexpr int MAX_STATE_DIM = 3;
+constexpr int MAX_BASIS_ELEMENTS = 2000;
 
-const int MAX_STATE_DIM = 3;
-const int MAX_BASIS_ELEMENTS = 2000;
 // ============================================================================
 // UTILITIES
 // ============================================================================
 
-std::string loadKernelSource(const char* filename) {
+std::string loadKernelSource(const std::string& filename) {
     std::ifstream file(filename);
     if (!file.is_open()) {
         throw std::runtime_error(std::string("Failed to open: ") + filename);
@@ -38,7 +39,7 @@ std::string loadKernelSource(const char* filename) {
     return buffer.str();
 }
 
-void checkError(cl_int error, const char* message) {
+void checkError(const cl_int error, const char* message) {
     if (error != CL_SUCCESS) {
         std::cerr << "Error (" << error << "): " << message << std::endl;
         throw std::runtime_error(message);
@@ -61,6 +62,7 @@ private:
     int safe_set_size;
     
     // Precomputed transitions
+    ///TODO: @MK: maybe a std::vector, or at least a smart pointer?
     int* next_state_table;
     int total_states;
     
@@ -96,6 +98,7 @@ public:
     }
     
     void setupRanges() {
+        ///TODO: @MK: same as above comment regarding STATE_DIM.
         int state_dim = is_3d ? 3 : 2;
         
         if (is_3d) {
@@ -161,6 +164,7 @@ public:
         const char* cache_file = is_3d ? "transition_cache_3d.bin" : "transition_cache_2d.bin";
         std::ifstream cache_in(cache_file, std::ios::binary);
         if (cache_in.good()) {
+            std::cout << "Loading transition table from cache: " << cache_file << std::endl << std::flush;
             int cached_states;
             cache_in.read(reinterpret_cast<char*>(&cached_states), sizeof(int));
             if (cached_states == total_states) {
@@ -173,38 +177,66 @@ public:
         }
         
         // Compute on GPU
+        std::cout << "Creating buffers..." << std::endl << std::flush;
         cl_int err;
-        cl_mem d_x_range_min = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(double) * MAX_STATE_DIM, x_range_min, &err);
-        cl_mem d_x_range_max = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(double) * MAX_STATE_DIM, x_range_max, &err);
-        cl_mem d_x_res = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(double) * MAX_STATE_DIM, x_res, &err);
-        cl_mem d_x_numCells = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(int) * MAX_STATE_DIM, x_numCells, &err);
-        cl_mem d_x_priority = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(int) * MAX_STATE_DIM, x_priority, &err);
-        cl_mem d_next_state_table = clCreateBuffer(context, CL_MEM_WRITE_ONLY,
-            sizeof(int) * total_states * MAX_STATE_DIM, nullptr, &err);
+        cl_mem d_total_states = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int), &total_states, &err);
+        checkError(err, "Create total_states buffer failed");
+        cl_mem d_state_dim = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int), &state_dim, &err);
+        checkError(err, "Create state_dim buffer failed");
+        cl_mem d_is_3d_int = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(bool), &is_3d, &err);
+        checkError(err, "Create is_3d buffer failed");
+        cl_mem d_dt = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(double), &dt, &err);
+        checkError(err, "Create dt buffer failed");
+        cl_mem d_x_range_min = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(double) * MAX_STATE_DIM, x_range_min, &err);
+        checkError(err, "Create x_range_min buffer failed");
+        cl_mem d_x_range_max = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(double) * MAX_STATE_DIM, x_range_max, &err);
+        checkError(err, "Create x_range_max buffer failed");
+        cl_mem d_x_res = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(double) * MAX_STATE_DIM, x_res, &err);
+        checkError(err, "Create x_res buffer failed");
+        cl_mem d_x_numCells = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * MAX_STATE_DIM, x_numCells, &err);
+        checkError(err, "Create x_numCells buffer failed");
+        cl_mem d_x_priority = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * MAX_STATE_DIM, x_priority, &err);
+        checkError(err, "Create x_priority buffer failed");
+        cl_mem d_next_state_table = clCreateBuffer(context, CL_MEM_WRITE_ONLY, sizeof(int) * total_states * MAX_STATE_DIM, nullptr, &err);
+        checkError(err, "Create next_state_table buffer failed");
         
+        ///TODO: @MK: I'd suggest collecting all read-only vars into one struct and passing a single buffer to reduce the number of kernel arguments (may also reduce memory due to padding).
+        std::cout << "Setting kernel arguments..." << std::endl;
         int is_3d_int = is_3d ? 1 : 0;
-        clSetKernelArg(kernel_trans, 0, sizeof(int), &total_states);
-        clSetKernelArg(kernel_trans, 1, sizeof(int), &state_dim);
-        clSetKernelArg(kernel_trans, 2, sizeof(int), &is_3d_int);
-        clSetKernelArg(kernel_trans, 3, sizeof(double), &dt);
-        clSetKernelArg(kernel_trans, 4, sizeof(cl_mem), &d_x_range_min);
-        clSetKernelArg(kernel_trans, 5, sizeof(cl_mem), &d_x_range_max);
-        clSetKernelArg(kernel_trans, 6, sizeof(cl_mem), &d_x_res);
-        clSetKernelArg(kernel_trans, 7, sizeof(cl_mem), &d_x_numCells);
-        clSetKernelArg(kernel_trans, 8, sizeof(cl_mem), &d_x_priority);
-        clSetKernelArg(kernel_trans, 9, sizeof(cl_mem), &d_next_state_table);
+        err = clSetKernelArg(kernel_trans, 0, sizeof(cl_mem), &d_total_states);
+        checkError(err, "Set kernel arg 0 failed");
+        err = clSetKernelArg(kernel_trans, 1, sizeof(cl_mem), &d_state_dim);
+        checkError(err, "Set kernel arg 1 failed");
+        err = clSetKernelArg(kernel_trans, 2, sizeof(cl_mem), &d_is_3d_int);
+        checkError(err, "Set kernel arg 2 failed");
+        err = clSetKernelArg(kernel_trans, 3, sizeof(cl_mem), &d_dt);
+        checkError(err, "Set kernel arg 3 failed");
+        err = clSetKernelArg(kernel_trans, 4, sizeof(cl_mem), &d_x_range_min);
+        checkError(err, "Set kernel arg 4 failed");
+        err = clSetKernelArg(kernel_trans, 5, sizeof(cl_mem), &d_x_range_max);
+        checkError(err, "Set kernel arg 5 failed");
+        err = clSetKernelArg(kernel_trans, 6, sizeof(cl_mem), &d_x_res);
+        checkError(err, "Set kernel arg 6 failed");
+        err = clSetKernelArg(kernel_trans, 7, sizeof(cl_mem), &d_x_numCells);
+        checkError(err, "Set kernel arg 7 failed");
+        err = clSetKernelArg(kernel_trans, 8, sizeof(cl_mem), &d_x_priority);
+        checkError(err, "Set kernel arg 8 failed");
+        err = clSetKernelArg(kernel_trans, 9, sizeof(cl_mem), &d_next_state_table);
+        checkError(err, "Set kernel arg 9 failed");
         
+        std::cout << "Launching kernel..." << std::endl;
         size_t global = ((total_states + 255) / 256) * 256;
         clEnqueueNDRangeKernel(queue, kernel_trans, 1, nullptr, &global, nullptr, 0, nullptr, nullptr);
         clFinish(queue);
         clEnqueueReadBuffer(queue, d_next_state_table, CL_TRUE, 0,
             sizeof(int) * total_states * MAX_STATE_DIM, next_state_table, 0, nullptr, nullptr);
         
+        // Cleanup
+        std::cout << "Releasing buffers..." << std::endl;
+        clReleaseMemObject(d_total_states);
+        clReleaseMemObject(d_state_dim);
+        clReleaseMemObject(d_is_3d_int);
+        clReleaseMemObject(d_dt);
         clReleaseMemObject(d_x_range_min);
         clReleaseMemObject(d_x_range_max);
         clReleaseMemObject(d_x_res);
@@ -227,15 +259,23 @@ public:
         
         // Allocate GPU buffers ONCE (no reallocation overhead)
         // Use pinned memory (CL_MEM_ALLOC_HOST_PTR) for faster transfers
+        std::cout << "Allocating GPU buffers..." << std::endl << std::flush;
+        ///TODO: @MK: error handling for OpenCL calls missing here and elsewhere.
         cl_int err;
-        cl_mem d_next_state_table = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR,
-            sizeof(int) * total_states * MAX_STATE_DIM, next_state_table, &err);
-        cl_mem d_basis_list = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
-            sizeof(int) * MAX_BASIS_ELEMENTS * MAX_STATE_DIM, nullptr, &err);
-        cl_mem d_basis_flat = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR,
-            sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
-        cl_mem d_unsafe_flags = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR,
-            sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
+        cl_mem d_total_states = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int), &total_states, &err);
+        checkError(err, "Create total_states buffer failed");
+        cl_mem d_state_dim = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int), &state_dim, &err);
+        checkError(err, "Create state_dim buffer failed");
+        cl_mem d_next_state_table = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int) * total_states * MAX_STATE_DIM, next_state_table, &err);
+        checkError(err, "Create next_state_table buffer failed");
+        cl_mem d_safe_set_size = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(int), &safe_set_size, &err);
+        checkError(err, "Create safe_set_size buffer failed");
+        cl_mem d_basis_list = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(int) * MAX_BASIS_ELEMENTS * MAX_STATE_DIM, nullptr, &err);
+        checkError(err, "Create basis_list buffer failed");
+        cl_mem d_basis_flat = clCreateBuffer(context, CL_MEM_READ_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
+        checkError(err, "Create basis_flat buffer failed");
+        cl_mem d_unsafe_flags = clCreateBuffer(context, CL_MEM_WRITE_ONLY | CL_MEM_ALLOC_HOST_PTR, sizeof(int) * MAX_BASIS_ELEMENTS, nullptr, &err);
+        checkError(err, "Create unsafe_flags buffer failed");
         
         // Allocate CPU buffers
         int unsafe_flags[MAX_BASIS_ELEMENTS];
@@ -244,16 +284,25 @@ public:
         unsigned char* seen_neighbors = new unsigned char[total_states];
         
         // Set static kernel args
-        clSetKernelArg(kernel_safety, 0, sizeof(cl_mem), &d_basis_flat);
-        clSetKernelArg(kernel_safety, 1, sizeof(cl_mem), &d_next_state_table);
-        clSetKernelArg(kernel_safety, 2, sizeof(cl_mem), &d_basis_list);
-        clSetKernelArg(kernel_safety, 4, sizeof(cl_mem), &d_unsafe_flags);
-        clSetKernelArg(kernel_safety, 5, sizeof(int), &total_states);
-        clSetKernelArg(kernel_safety, 6, sizeof(int), &state_dim);
+        /// TODO: @MK: returned error handling missing here.
+        std::cout << "Setting kernel arguments..." << std::endl << std::flush;
+        err = clSetKernelArg(kernel_safety, 0, sizeof(cl_mem), &d_basis_flat);
+        checkError(err, "Set kernel arg 0 failed");
+        err = clSetKernelArg(kernel_safety, 1, sizeof(cl_mem), &d_next_state_table);
+        checkError(err, "Set kernel arg 1 failed");
+        err = clSetKernelArg(kernel_safety, 2, sizeof(cl_mem), &d_basis_list);
+        checkError(err, "Set kernel arg 2 failed");
+        err = clSetKernelArg(kernel_safety, 4, sizeof(cl_mem), &d_unsafe_flags);
+        checkError(err, "Set kernel arg 4 failed");
+        err = clSetKernelArg(kernel_safety, 5, sizeof(cl_mem), &d_total_states);
+        checkError(err, "Set kernel arg 5 failed");
+        err = clSetKernelArg(kernel_safety, 6, sizeof(cl_mem), &d_state_dim);
+        checkError(err, "Set kernel arg 6 failed");
         
         auto compute_start = std::chrono::high_resolution_clock::now();
         
         // Fixed-point iteration
+        std::cout << "Starting fixed-point iterations..." << std::endl << std::flush;
         while (true) {
             out_iterations++;
             if (safe_set_size == 0) break;
@@ -263,23 +312,25 @@ public:
             size_t flat_bytes = sizeof(int) * safe_set_size;
             
             // Async uploads
+            ///TODO: @MK: are events really needed here? You could just use clFinish after each step to simplify the code. You are not measuring performance here anyway.
             cl_event upload_events[2];
-            clEnqueueWriteBuffer(queue, d_basis_list, CL_FALSE, 0, basis_bytes, 
-                                safe_set_basis, 0, nullptr, &upload_events[0]);
-            clEnqueueWriteBuffer(queue, d_basis_flat, CL_FALSE, 0, flat_bytes, 
-                                safe_set_flat_indices, 0, nullptr, &upload_events[1]);
+            err = clEnqueueWriteBuffer(queue, d_basis_list, CL_FALSE, 0, basis_bytes, safe_set_basis, 0, nullptr, &upload_events[0]);
+            checkError(err, "Enqueue write buffer d_basis_list failed");
+            err = clEnqueueWriteBuffer(queue, d_basis_flat, CL_FALSE, 0, flat_bytes, safe_set_flat_indices, 0, nullptr, &upload_events[1]);
+            checkError(err, "Enqueue write buffer d_basis_flat failed");
             
             // Kernel waits for uploads
-            clSetKernelArg(kernel_safety, 3, sizeof(int), &safe_set_size);
+            err = clSetKernelArg(kernel_safety, 3, sizeof(cl_mem), &d_safe_set_size);
+            checkError(err, "Set kernel arg 3 failed");
             size_t global = ((safe_set_size + 127) / 128) * 128;
             cl_event kernel_event;
-            clEnqueueNDRangeKernel(queue, kernel_safety, 1, nullptr, &global, nullptr, 
-                                  2, upload_events, &kernel_event);
+            err = clEnqueueNDRangeKernel(queue, kernel_safety, 1, nullptr, &global, nullptr, 2, upload_events, &kernel_event);
+            checkError(err, "Enqueue NDRange kernel failed");
             
             // Readback waits for kernel
             cl_event read_event;
-            clEnqueueReadBuffer(queue, d_unsafe_flags, CL_FALSE, 0, flat_bytes, 
-                               unsafe_flags, 1, &kernel_event, &read_event);
+            err = clEnqueueReadBuffer(queue, d_unsafe_flags, CL_FALSE, 0, flat_bytes, unsafe_flags, 1, &kernel_event, &read_event);
+            checkError(err, "Enqueue read buffer failed");
             
             // Wait for pipeline
             clWaitForEvents(1, &read_event);
@@ -297,6 +348,8 @@ public:
         out_basis_elements = safe_set_size;
         
         delete[] seen_neighbors;
+        clReleaseMemObject(d_total_states);
+        clReleaseMemObject(d_state_dim);
         clReleaseMemObject(d_next_state_table);
         clReleaseMemObject(d_basis_list);
         clReleaseMemObject(d_basis_flat);
@@ -306,7 +359,7 @@ public:
     }
     
 private:
-    void buildKernel(const char* file, const char* name, cl_program& prog, cl_kernel& kern, cl_device_id dev) {
+    void buildKernel(const std::string& file, const std::string& name, cl_program& prog, cl_kernel& kern, cl_device_id dev) {
         cl_int err;
         std::string src = loadKernelSource(file);
         const char* src_str = src.c_str();
@@ -326,10 +379,11 @@ private:
             throw std::runtime_error("Build failed");
         }
         
-        kern = clCreateKernel(prog, name, &err);
+        kern = clCreateKernel(prog, name.c_str(), &err);
         checkError(err, "Create kernel failed");
     }
     
+    ///TODO: @MK: We should discuss how to parallelize this as well, or parts of it at least.
     int updateSafeSet(int* unsafe_flags, unsigned char* unsafe_mask, 
                       unsigned char* seen_neighbors, int* neighbor_buffer, int state_dim) {
         // Clear masks
@@ -364,7 +418,10 @@ private:
                 }
             }
         }
+
+        ///TODO: @MK: [TO_DISCUSS] The code from the beginning down to here (clearing mem + the first loop) can be done in a separate kernel the GPU.
         
+        ///TODO: @MK: [TO_DISCUSS] This next loop seems like a Run-length Encoding (RLE)-like pattern. Can be also be parallelized on GPU.
         // Remove unsafe elements
         int write_pos = 0;
         for (int i = 0; i < safe_set_size; ++i) {
@@ -380,6 +437,9 @@ private:
         }
         safe_set_size = write_pos;
         
+
+        ///TODO: @MK: [TO_DISCUSS] This is to be kept serial due to the possible non-deterministic order of adding new neighbors. Or we need to do more research on the theory side regarding order of additions.
+
         // Add new neighbors
         int added = 0;
         for (int ni = 0; ni < neighbor_count; ++ni) {

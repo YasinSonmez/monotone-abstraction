@@ -11,6 +11,9 @@ High-performance C++ implementations of safe set computation for vehicle followi
 
 ## Quick Start
 
+
+@MK: The following needs to be adjusted. There is no makefile in this project; build is managed with a sh script. I'd also consider switching to CMake or Bazel but this is a different story.
+
 ```bash
 # Build all versions
 make all
