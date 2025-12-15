@@ -40,7 +40,7 @@ echo ""
 echo "==================================="
 echo "Compiling $CPP_SOURCE..."
 echo "==================================="
-g++ -std=c++17 -O3 -o "$EXECUTABLE" "$CPP_SOURCE" -framework OpenCL
+clang++ -std=c++17 -O3 -o "$EXECUTABLE" "$CPP_SOURCE" -framework OpenCL
 
 echo ""
 echo "==================================="
