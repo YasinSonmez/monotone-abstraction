@@ -1,0 +1,32 @@
+#-----------------------------------------------------------------------
+# File: mono_synth_check_safety.mem
+# Description: Memory configuration for check_basis_safety kernel
+#-----------------------------------------------------------------------
+
+# function: check_basis_safety
+check_basis_safety { 
+
+	# argument 0: transitions_bag (XU bag)
+	transitions_bag {
+        MemConfig = "pfaces_rw_global";
+		isRangeScalable = "true";
+	}
+
+	# argument 1: lists_bag (RO bag)
+	lists_bag {
+        MemConfig = "pfaces_ro_global";
+		isRangeScalable = "false";
+	}
+
+	# argument 2: output_bag (RW bag)
+	output_bag {
+        MemConfig = "pfaces_rw_global";
+		isRangeScalable = "false";
+	}
+
+	# argument 3: config_bag (Config struct)
+	config_bag {
+        MemConfig = "pfaces_ro_constant";
+		isRangeScalable = "false";
+	}
+}
